@@ -118,6 +118,7 @@ export type GenerateOptions = {
  */
 export type RerankOptions = {
   model?: string;
+  topK?: number;
 };
 
 /**
@@ -297,6 +298,11 @@ export interface LLM {
    * Get embeddings for text
    */
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
+
+  /**
+   * Batch embedding for better throughput where supported.
+   */
+  embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
 
   /**
    * Generate text completion
@@ -1417,4 +1423,70 @@ export async function disposeDefaultLlamaCpp(): Promise<void> {
     await defaultLlamaCpp.dispose();
     defaultLlamaCpp = null;
   }
+}
+
+// =============================================================================
+// Provider Selection (Local vs Remote)
+// =============================================================================
+
+let defaultLLM: LLM | null = null;
+
+/**
+ * Get the default LLM instance based on QMD_PROVIDER env var.
+ * - "voyage" or "openai" → RemoteLLM (API-based)
+ * - unset or "local" → LlamaCpp (local models)
+ */
+export async function getDefaultLLM(): Promise<LLM> {
+  if (defaultLLM) return defaultLLM;
+
+  const provider = process.env.QMD_PROVIDER?.toLowerCase();
+
+  if (provider === "voyage" || provider === "openai") {
+    // Dynamic import to avoid loading remote.ts when not needed
+    const { RemoteLLM } = await import("./remote.js");
+    defaultLLM = new RemoteLLM({ provider: provider as "voyage" | "openai" });
+  } else {
+    defaultLLM = getDefaultLlamaCpp();
+  }
+
+  return defaultLLM;
+}
+
+/**
+ * Get provider info for status display
+ */
+export function getProviderInfo(): { provider: string; embedModel: string; rerankModel: string } {
+  const provider = process.env.QMD_PROVIDER?.toLowerCase() || "local";
+
+  if (provider === "voyage") {
+    return {
+      provider: "voyage",
+      embedModel: process.env.VOYAGE_EMBED_MODEL || "voyage-4-lite",
+      rerankModel: process.env.VOYAGE_RERANK_MODEL || "rerank-2",
+    };
+  } else if (provider === "openai") {
+    return {
+      provider: "openai",
+      embedModel: process.env.OPENAI_EMBED_MODEL || "text-embedding-3-small",
+      rerankModel: "(none)",
+    };
+  }
+
+  return {
+    provider: "local",
+    embedModel: process.env.QMD_EMBED_MODEL || "embeddinggemma",
+    rerankModel: process.env.QMD_RERANK_MODEL || "ExpedientFalcon/qwen3-reranker:0.6b-q8_0",
+  };
+}
+
+/**
+ * Dispose the default LLM instance
+ */
+export async function disposeDefaultLLM(): Promise<void> {
+  if (defaultLLM) {
+    await defaultLLM.dispose();
+    defaultLLM = null;
+  }
+  // Also dispose LlamaCpp if it was used
+  await disposeDefaultLlamaCpp();
 }

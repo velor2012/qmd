@@ -69,8 +69,9 @@ import {
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
   getDefaultDbPath,
+  getProviderInfo,
 } from "./store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
+import { disposeDefaultLLM, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -294,9 +295,13 @@ async function showStatus(): Promise<void> {
   // Most recent update across all collections
   const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get() as { latest: string | null };
 
+  // Provider info
+  const providerInfo = getProviderInfo();
+
   console.log(`${c.bold}QMD Status${c.reset}\n`);
   console.log(`Index: ${dbPath}`);
   console.log(`Size:  ${formatBytes(indexSize)}`);
+  console.log(`Provider: ${c.cyan}${providerInfo.provider}${c.reset} (${providerInfo.embedModel})`);
 
   // MCP daemon status (check PID file liveness)
   const mcpCacheDir = process.env.XDG_CACHE_HOME
@@ -2418,6 +2423,15 @@ function showHelp(): void {
   console.log("  --max-bytes <num>          - Skip files larger than N bytes (default 10240)");
   console.log("  --json/--csv/--md/--xml/--files - Same formats as search");
   console.log("");
+  console.log("Environment variables (remote providers):");
+  console.log("  QMD_PROVIDER               - Provider: local (default), voyage, openai");
+  console.log("  VOYAGE_API_KEY             - Voyage AI API key");
+  console.log("  VOYAGE_EMBED_MODEL         - Voyage model (default: voyage-4-lite)");
+  console.log("  VOYAGE_RERANK_MODEL        - Voyage rerank model (default: rerank-2)");
+  console.log("  OPENAI_API_KEY             - OpenAI API key");
+  console.log("  OPENAI_EMBED_MODEL         - OpenAI model (default: text-embedding-3-small)");
+  console.log("  OPENAI_API_BASE            - Base URL for OpenAI-compatible APIs");
+  console.log("");
   console.log(`Index: ${getDbPath()}`);
 }
 
@@ -2893,7 +2907,7 @@ if (isMain) {
   }
 
   if (cli.command !== "mcp") {
-    await disposeDefaultLlamaCpp();
+    await disposeDefaultLLM();
     process.exit(0);
   }
 

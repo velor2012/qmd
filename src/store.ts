@@ -17,11 +17,13 @@ import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { realpathSync, statSync, mkdirSync } from "node:fs";
 import {
-  LlamaCpp,
   getDefaultLlamaCpp,
+  getDefaultLLM,
+  getProviderInfo,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   type RerankDocument,
+  type EmbeddingResult,
   type ILLMSession,
 } from "./llm.js";
 import {
@@ -1352,7 +1354,7 @@ export function getActiveDocumentPaths(db: Database, collectionName: string): st
   return rows.map(r => r.path);
 }
 
-export { formatQueryForEmbedding, formatDocForEmbedding };
+export { formatQueryForEmbedding, formatDocForEmbedding, getProviderInfo };
 
 export function chunkDocument(
   content: string,
@@ -2243,10 +2245,20 @@ export async function searchVec(db: Database, query: string, model: string, limi
 async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession): Promise<number[] | null> {
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
-  const result = session
+  const provider = process.env.QMD_PROVIDER?.toLowerCase() || "local";
+  const result = (session && provider === "local")
     ? await session.embed(formattedText, { model, isQuery })
-    : await getDefaultLlamaCpp().embed(formattedText, { model, isQuery });
+    : await (await getDefaultLLM()).embed(formattedText, { model, isQuery });
   return result?.embedding || null;
+}
+
+async function embedTextBatch(
+  texts: string[],
+  model: string,
+  isQuery: boolean
+): Promise<(EmbeddingResult | null)[]> {
+  const llm = await getDefaultLLM();
+  return llm.embedBatch(texts, { model, isQuery });
 }
 
 /**
@@ -2310,8 +2322,8 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     }
   }
 
+  // Query expansion always uses local LlamaCpp (not available via remote API)
   const llm = getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
   const results = await llm.expandQuery(query);
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
@@ -2348,9 +2360,9 @@ export async function rerank(query: string, documents: { file: string; text: str
     }
   }
 
-  // Rerank uncached documents using LlamaCpp
+  // Rerank uncached documents
   if (uncachedDocs.length > 0) {
-    const llm = getDefaultLlamaCpp();
+    const llm = await getDefaultLLM();
     const rerankResult = await llm.rerank(query, uncachedDocs, { model });
 
     // Cache results — use original doc.text for cache key (result.file lacks chunk text)
@@ -2984,11 +2996,10 @@ export async function hybridQuery(
     }
 
     // Batch embed all vector queries in a single call
-    const llm = getDefaultLlamaCpp();
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
-    const embeddings = await llm.embedBatch(textsToEmbed);
+    const embeddings = await embedTextBatch(textsToEmbed, DEFAULT_EMBED_MODEL, true);
     hooks?.onEmbedDone?.(Date.now() - embedStart);
 
     // Run sqlite-vec lookups with pre-computed embeddings
@@ -3273,11 +3284,10 @@ export async function structuredSearch(
   if (hasVectors) {
     const vecSearches = searches.filter(s => s.type === 'vec' || s.type === 'hyde');
     if (vecSearches.length > 0) {
-      const llm = getDefaultLlamaCpp();
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
-      const embeddings = await llm.embedBatch(textsToEmbed);
+      const embeddings = await embedTextBatch(textsToEmbed, DEFAULT_EMBED_MODEL, true);
       hooks?.onEmbedDone?.(Date.now() - embedStart);
 
       for (let i = 0; i < vecSearches.length; i++) {
