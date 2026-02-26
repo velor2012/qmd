@@ -3,6 +3,14 @@ import { RemoteLLM } from "../src/remote.js";
 import { disposeDefaultLLM, getDefaultLLM, getProviderInfo } from "../src/llm.js";
 
 const ENV_KEYS = [
+  "QMD_VOYAGE_API_KEY",
+  "QMD_VOYAGE_API_BASE",
+  "QMD_VOYAGE_EMBED_MODEL",
+  "QMD_VOYAGE_RERANK_MODEL",
+  "QMD_OPENAI_API_KEY",
+  "QMD_OPENAI_API_BASE",
+  "QMD_OPENAI_EMBED_MODEL",
+  "QMD_OPENAI_RERANK_MODEL",
   "QMD_PROVIDER",
   "VOYAGE_API_KEY",
   "VOYAGE_API_BASE",
@@ -11,6 +19,7 @@ const ENV_KEYS = [
   "OPENAI_API_KEY",
   "OPENAI_API_BASE",
   "OPENAI_EMBED_MODEL",
+  "OPENAI_RERANK_MODEL",
 ];
 
 const envBackup = new Map<string, string | undefined>();
@@ -49,7 +58,7 @@ describe("Remote providers", () => {
   });
 
   test("RemoteLLM(voyage) sends query input_type and default model", async () => {
-    process.env.VOYAGE_API_KEY = "test-key";
+    process.env.QMD_VOYAGE_API_KEY = "test-key";
     const fetchMock = setFetchMock({
       object: "list",
       data: [{ object: "embedding", embedding: [0.1, 0.2], index: 0 }],
@@ -72,7 +81,7 @@ describe("Remote providers", () => {
   });
 
   test("RemoteLLM embedBatch maps response by returned index", async () => {
-    process.env.VOYAGE_API_KEY = "test-key";
+    process.env.QMD_VOYAGE_API_KEY = "test-key";
     setFetchMock({
       object: "list",
       data: [
@@ -92,7 +101,7 @@ describe("Remote providers", () => {
   });
 
   test("RemoteLLM(openai) rerank falls back to input order", async () => {
-    process.env.OPENAI_API_BASE = "http://localhost:11434/v1";
+    process.env.QMD_OPENAI_API_BASE = "http://localhost:11434/v1";
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const llm = new RemoteLLM({ provider: "openai" });
 
@@ -107,13 +116,43 @@ describe("Remote providers", () => {
     expect(warnSpy).toHaveBeenCalled();
   });
 
+  test("RemoteLLM(openai) uses OPENAI_RERANK_MODEL for /rerank requests", async () => {
+    process.env.QMD_OPENAI_API_BASE = "http://localhost:11434/v1";
+    process.env.OPENAI_RERANK_MODEL = "BAAI/bge-reranker-v2-m3";
+    const fetchMock = setFetchMock({
+      object: "list",
+      data: [
+        { index: 1, relevance_score: 0.91 },
+        { index: 0, relevance_score: 0.22 },
+      ],
+      model: "BAAI/bge-reranker-v2-m3",
+      usage: { total_tokens: 18 },
+    });
+    const llm = new RemoteLLM({ provider: "openai" });
+
+    const result = await llm.rerank("query", [
+      { file: "a.md", text: "A" },
+      { file: "b.md", text: "B" },
+    ]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("http://localhost:11434/v1/rerank");
+    const body = JSON.parse((init as RequestInit).body as string);
+    expect(body.model).toBe("BAAI/bge-reranker-v2-m3");
+    expect(body.query).toBe("query");
+    expect(body.documents).toEqual(["A", "B"]);
+    expect(result.model).toBe("BAAI/bge-reranker-v2-m3");
+    expect(result.results.map((r) => r.file)).toEqual(["b.md", "a.md"]);
+  });
+
   test("RemoteLLM(voyage) throws when API key is missing", () => {
     expect(() => new RemoteLLM({ provider: "voyage" })).toThrow("Voyage API key required");
   });
 
   test("getDefaultLLM selects remote provider and keeps singleton", async () => {
     process.env.QMD_PROVIDER = "openai";
-    process.env.OPENAI_API_BASE = "http://localhost:11434/v1";
+    process.env.QMD_OPENAI_API_BASE = "http://localhost:11434/v1";
 
     const llm1 = await getDefaultLLM();
     const llm2 = await getDefaultLLM();
@@ -124,7 +163,7 @@ describe("Remote providers", () => {
 
   test("disposeDefaultLLM resets provider singleton", async () => {
     process.env.QMD_PROVIDER = "openai";
-    process.env.OPENAI_API_BASE = "http://localhost:11434/v1";
+    process.env.QMD_OPENAI_API_BASE = "http://localhost:11434/v1";
     const llm1 = await getDefaultLLM();
 
     await disposeDefaultLLM();
@@ -149,11 +188,12 @@ describe("Remote providers", () => {
     });
 
     process.env.QMD_PROVIDER = "openai";
-    process.env.OPENAI_EMBED_MODEL = "text-embedding-3-large";
+    process.env.QMD_OPENAI_EMBED_MODEL = "text-embedding-3-large";
+    process.env.OPENAI_RERANK_MODEL = "BAAI/bge-reranker-v2-m3";
     expect(getProviderInfo()).toEqual({
       provider: "openai",
       embedModel: "text-embedding-3-large",
-      rerankModel: "(none)",
+      rerankModel: "BAAI/bge-reranker-v2-m3",
     });
   });
 });

@@ -31,6 +31,7 @@ import {
   hashContent,
   extractTitle,
   formatDocForEmbedding,
+  chunkDocument,
   chunkDocumentByTokens,
   clearCache,
   getCacheKey,
@@ -71,7 +72,7 @@ import {
   getDefaultDbPath,
   getProviderInfo,
 } from "./store.js";
-import { disposeDefaultLLM, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
+import { disposeDefaultLLM, getDefaultLlamaCpp, getDefaultLLM, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -1538,6 +1539,9 @@ function renderProgressBar(percent: number, width: number = 30): string {
 async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean = false): Promise<void> {
   const db = getDb();
   const now = new Date().toISOString();
+  const provider = process.env.QMD_PROVIDER?.toLowerCase() || "local";
+  const providerInfo = getProviderInfo();
+  const embedModelName = provider === "local" ? model : providerInfo.embedModel;
 
   // If force, clear all vectors
   if (force) {
@@ -1559,8 +1563,10 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   const allChunks: ChunkItem[] = [];
   let multiChunkDocs = 0;
 
-  // Chunk all documents using actual token counts
-  process.stderr.write(`Chunking ${hashesToEmbed.length} documents by token count...\n`);
+  // Local provider uses tokenizer-based chunking for accuracy.
+  // Remote providers avoid local tokenizer dependency.
+  const useTokenChunking = provider === "local";
+  process.stderr.write(`Chunking ${hashesToEmbed.length} documents by ${useTokenChunking ? "token count" : "character heuristic"}...\n`);
   for (const item of hashesToEmbed) {
     const encoder = new TextEncoder();
     const bodyBytes = encoder.encode(item.body).length;
@@ -1568,7 +1574,9 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
 
     const title = extractTitle(item.body, item.path);
     const displayName = item.path;
-    const chunks = await chunkDocumentByTokens(item.body);  // Uses actual tokenizer
+    const chunks = useTokenChunking
+      ? await chunkDocumentByTokens(item.body)
+      : chunkDocument(item.body).map((chunk) => ({ ...chunk, tokens: 0 }));
 
     if (chunks.length > 1) multiChunkDocs++;
 
@@ -1600,14 +1608,15 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   if (multiChunkDocs > 0) {
     console.log(`${c.dim}${multiChunkDocs} documents split into multiple chunks${c.reset}`);
   }
-  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
+  console.log(`${c.dim}Model: ${embedModelName}${c.reset}\n`);
 
   // Hide cursor during embedding
   cursor.hide();
 
-  // Wrap all LLM embedding operations in a session for lifecycle management
-  // Use 30 minute timeout for large collections
-  await withLLMSession(async (session) => {
+  const runEmbeddingPass = async (
+    embedOne: (text: string) => Promise<{ embedding: number[] } | null>,
+    embedBatch: (texts: string[]) => Promise<({ embedding: number[] } | null)[]>
+  ) => {
     // Get embedding dimensions from first chunk
     progress.indeterminate();
     const firstChunk = allChunks[0];
@@ -1615,7 +1624,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
       throw new Error("No chunks available to embed");
     }
     const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
-    const firstResult = await session.embed(firstText);
+    const firstResult = await embedOne(firstText);
     if (!firstResult) {
       throw new Error("Failed to get embedding dimensions from first chunk");
     }
@@ -1637,7 +1646,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
 
       try {
         // Batch embed all texts at once
-        const embeddings = await session.embedBatch(texts);
+        const embeddings = await embedBatch(texts);
 
         // Insert each embedding
         for (let i = 0; i < batch.length; i++) {
@@ -1645,7 +1654,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
           const embedding = embeddings[i];
 
           if (embedding) {
-            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), embedModelName, now);
             chunksEmbedded++;
           } else {
             errors++;
@@ -1658,9 +1667,9 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
         for (const chunk of batch) {
           try {
             const text = formatDocForEmbedding(chunk.text, chunk.title);
-            const result = await session.embed(text);
+            const result = await embedOne(text);
             if (result) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), embedModelName, now);
               chunksEmbedded++;
             } else {
               errors++;
@@ -1700,7 +1709,24 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     if (errors > 0) {
       console.log(`${c.yellow}⚠ ${errors} chunks failed${c.reset}`);
     }
-  }, { maxDuration: 30 * 60 * 1000, name: 'embed-command' });
+  };
+
+  if (provider === "local") {
+    // Local provider: use scoped LlamaCpp session for lifecycle and throughput stability.
+    await withLLMSession(async (session) => {
+      await runEmbeddingPass(
+        (text) => session.embed(text),
+        (texts) => session.embedBatch(texts)
+      );
+    }, { maxDuration: 30 * 60 * 1000, name: "embed-command" });
+  } else {
+    // Remote providers: use provider-aware LLM directly (Voyage/OpenAI-compatible).
+    const llm = await getDefaultLLM();
+    await runEmbeddingPass(
+      (text) => llm.embed(text, { model: embedModelName, isQuery: false }),
+      (texts) => llm.embedBatch(texts, { model: embedModelName, isQuery: false })
+    );
+  }
 
   closeDb();
 }
@@ -2059,6 +2085,17 @@ function logExpansionTree(originalQuery: string, expanded: ExpandedQuery[]): voi
   for (const line of lines) process.stderr.write(line + '\n');
 }
 
+async function withLocalSessionIfNeeded<T>(
+  fn: () => Promise<T>,
+  opts: { maxDuration: number; name: string }
+): Promise<T> {
+  const provider = process.env.QMD_PROVIDER?.toLowerCase() || "local";
+  if (provider !== "local") {
+    return fn();
+  }
+  return withLLMSession(async () => fn(), opts);
+}
+
 async function vectorSearch(query: string, opts: OutputOptions, _model: string = DEFAULT_EMBED_MODEL): Promise<void> {
   const store = getStore();
 
@@ -2069,7 +2106,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
 
   checkIndexHealth(store.db);
 
-  await withLLMSession(async () => {
+  await withLocalSessionIfNeeded(async () => {
     let results = await vectorSearchQuery(store, query, {
       collection: singleCollection,
       limit: opts.all ? 500 : (opts.limit || 10),
@@ -2110,7 +2147,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       context: r.context,
       docid: r.docid,
     })), query, { ...opts, limit: results.length });
-  }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
+  }, { maxDuration: 10 * 60 * 1000, name: "vectorSearch" });
 }
 
 async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
@@ -2126,7 +2163,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   // Check for structured query syntax (lex:/vec:/hyde: prefixes)
   const structuredQueries = parseStructuredQuery(query);
 
-  await withLLMSession(async () => {
+  await withLocalSessionIfNeeded(async () => {
     let results;
 
     if (structuredQueries) {
@@ -2234,7 +2271,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       context: r.context,
       docid: r.docid,
     })), displayQuery, { ...opts, limit: results.length });
-  }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
+  }, { maxDuration: 10 * 60 * 1000, name: "querySearch" });
 }
 
 // Parse CLI arguments using util.parseArgs
@@ -2425,12 +2462,14 @@ function showHelp(): void {
   console.log("");
   console.log("Environment variables (remote providers):");
   console.log("  QMD_PROVIDER               - Provider: local (default), voyage, openai");
-  console.log("  VOYAGE_API_KEY             - Voyage AI API key");
-  console.log("  VOYAGE_EMBED_MODEL         - Voyage model (default: voyage-4-lite)");
-  console.log("  VOYAGE_RERANK_MODEL        - Voyage rerank model (default: rerank-2)");
-  console.log("  OPENAI_API_KEY             - OpenAI API key");
-  console.log("  OPENAI_EMBED_MODEL         - OpenAI model (default: text-embedding-3-small)");
-  console.log("  OPENAI_API_BASE            - Base URL for OpenAI-compatible APIs");
+  console.log("  QMD_VOYAGE_API_KEY        - Voyage AI API key");
+  console.log("  QMD_VOYAGE_API_BASE       - Voyage API base URL");
+  console.log("  QMD_VOYAGE_EMBED_MODEL    - Voyage model (default: voyage-4-lite)");
+  console.log("  QMD_VOYAGE_RERANK_MODEL   - Voyage rerank model (default: rerank-2)");
+  console.log("  QMD_OPENAI_API_KEY        - OpenAI API key");
+  console.log("  QMD_OPENAI_EMBED_MODEL    - OpenAI model (default: text-embedding-3-small)");
+  console.log("  QMD_OPENAI_API_BASE       - Base URL for OpenAI-compatible APIs");
+  console.log("  QMD_RERANK_CONTEXT_SIZE   - Local rerank context size (default: 2048)");
   console.log("");
   console.log(`Index: ${getDbPath()}`);
 }

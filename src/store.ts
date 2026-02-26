@@ -2322,9 +2322,13 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     }
   }
 
-  // Query expansion always uses local LlamaCpp (not available via remote API)
-  const llm = getDefaultLlamaCpp();
-  const results = await llm.expandQuery(query);
+  // Provider-aware expansion:
+  // - local provider: use local LlamaCpp expansion model
+  // - remote providers: delegate to provider implementation (may return lightweight defaults)
+  const provider = process.env.QMD_PROVIDER?.toLowerCase() || "local";
+  const results = provider === "local"
+    ? await getDefaultLlamaCpp().expandQuery(query)
+    : await (await getDefaultLLM()).expandQuery(query);
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
   // Filter out entries that duplicate the original query text.
@@ -2343,7 +2347,8 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string | undefined, db: Database): Promise<{ file: string; score: number }[]> {
+  const cacheModel = model || "none";
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocs: RerankDocument[] = [];
 
@@ -2351,7 +2356,7 @@ export async function rerank(query: string, documents: { file: string; text: str
   // Cache key includes chunk text — different queries can select different chunks
   // from the same file, and the reranker score depends on which chunk was sent.
   for (const doc of documents) {
-    const cacheKey = getCacheKey("rerank", { query, file: doc.file, model, chunk: doc.text });
+    const cacheKey = getCacheKey("rerank", { query, file: doc.file, model: cacheModel, chunk: doc.text });
     const cached = getCachedResult(db, cacheKey);
     if (cached !== null) {
       cachedResults.set(doc.file, parseFloat(cached));
@@ -2363,12 +2368,14 @@ export async function rerank(query: string, documents: { file: string; text: str
   // Rerank uncached documents
   if (uncachedDocs.length > 0) {
     const llm = await getDefaultLLM();
-    const rerankResult = await llm.rerank(query, uncachedDocs, { model });
+    const rerankResult = model
+      ? await llm.rerank(query, uncachedDocs, { model })
+      : await llm.rerank(query, uncachedDocs);
 
     // Cache results — use original doc.text for cache key (result.file lacks chunk text)
     const textByFile = new Map(documents.map(d => [d.file, d.text]));
     for (const result of rerankResult.results) {
-      const cacheKey = getCacheKey("rerank", { query, file: result.file, model, chunk: textByFile.get(result.file) || "" });
+      const cacheKey = getCacheKey("rerank", { query, file: result.file, model: cacheModel, chunk: textByFile.get(result.file) || "" });
       setCachedResult(db, cacheKey, result.score.toString());
       cachedResults.set(result.file, result.score);
     }
@@ -2928,6 +2935,9 @@ export async function hybridQuery(
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const collection = options?.collection;
   const hooks = options?.hooks;
+  const providerInfo = getProviderInfo();
+  const embedModel = providerInfo.embedModel;
+  const rerankModel = providerInfo.rerankModel === "(none)" ? undefined : providerInfo.rerankModel;
 
   const rankedLists: RankedResult[][] = [];
   const docidMap = new Map<string, string>(); // filepath -> docid
@@ -2999,7 +3009,7 @@ export async function hybridQuery(
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
-    const embeddings = await embedTextBatch(textsToEmbed, DEFAULT_EMBED_MODEL, true);
+    const embeddings = await embedTextBatch(textsToEmbed, embedModel, true);
     hooks?.onEmbedDone?.(Date.now() - embedStart);
 
     // Run sqlite-vec lookups with pre-computed embeddings
@@ -3008,7 +3018,7 @@ export async function hybridQuery(
       if (!embedding) continue;
 
       const vecResults = await store.searchVec(
-        vecQueries[i]!.text, DEFAULT_EMBED_MODEL, 20, collection,
+        vecQueries[i]!.text, embedModel, 20, collection,
         undefined, embedding
       );
       if (vecResults.length > 0) {
@@ -3054,7 +3064,7 @@ export async function hybridQuery(
   // Step 6: Rerank chunks (NOT full bodies)
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart = Date.now();
-  const reranked = await store.rerank(query, chunksToRerank);
+  const reranked = await store.rerank(query, chunksToRerank, rerankModel);
   hooks?.onRerankDone?.(Date.now() - rerankStart);
 
   // Step 7: Blend RRF position score with reranker score
@@ -3138,6 +3148,7 @@ export async function vectorSearchQuery(
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0.3;
   const collection = options?.collection;
+  const embedModel = getProviderInfo().embedModel;
 
   const hasVectors = !!store.db.prepare(
     `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
@@ -3154,7 +3165,7 @@ export async function vectorSearchQuery(
   const queryTexts = [query, ...vecExpanded.map(q => q.text)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
-    const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit, collection);
+    const vecResults = await store.searchVec(q, embedModel, limit, collection);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {
@@ -3231,6 +3242,9 @@ export async function structuredSearch(
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const hooks = options?.hooks;
+  const providerInfo = getProviderInfo();
+  const embedModel = providerInfo.embedModel;
+  const rerankModel = providerInfo.rerankModel === "(none)" ? undefined : providerInfo.rerankModel;
 
   const collections = options?.collections;
 
@@ -3287,7 +3301,7 @@ export async function structuredSearch(
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
-      const embeddings = await embedTextBatch(textsToEmbed, DEFAULT_EMBED_MODEL, true);
+      const embeddings = await embedTextBatch(textsToEmbed, embedModel, true);
       hooks?.onEmbedDone?.(Date.now() - embedStart);
 
       for (let i = 0; i < vecSearches.length; i++) {
@@ -3296,7 +3310,7 @@ export async function structuredSearch(
 
         for (const coll of collectionList) {
           const vecResults = await store.searchVec(
-            vecSearches[i]!.query, DEFAULT_EMBED_MODEL, 20, coll,
+            vecSearches[i]!.query, embedModel, 20, coll,
             undefined, embedding
           );
           if (vecResults.length > 0) {
@@ -3351,7 +3365,7 @@ export async function structuredSearch(
   // Step 5: Rerank chunks
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart2 = Date.now();
-  const reranked = await store.rerank(primaryQuery, chunksToRerank);
+  const reranked = await store.rerank(primaryQuery, chunksToRerank, rerankModel);
   hooks?.onRerankDone?.(Date.now() - rerankStart2);
 
   // Step 6: Blend RRF position score with reranker score

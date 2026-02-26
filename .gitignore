@@ -18,3 +18,6 @@ texts/
 finetune/outputs/
 finetune/data/train/
 .claude/
+.gitnexus
+AGENTS.md
+CLAUDE.md

@@ -732,7 +732,13 @@ export class LlamaCpp implements LLM {
   // Qwen3 reranker template adds ~200 tokens overhead (system prompt, tags, etc.)
   // Chunks are max 800 tokens, so 800 + 200 + query ≈ 1100 tokens typical.
   // Use 2048 for safety margin. Still 17× less than auto (40960).
-  private static readonly RERANK_CONTEXT_SIZE = 2048;
+  // Override via QMD_RERANK_CONTEXT_SIZE (preferred) or legacy RERANK_CONTEXT_SIZE.
+  private static readonly RERANK_CONTEXT_SIZE = (() => {
+    const raw = process.env.QMD_RERANK_CONTEXT_SIZE || process.env.RERANK_CONTEXT_SIZE;
+    if (!raw) return 2048;
+    const parsed = parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 2048;
+  })();
 
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
     if (this.rerankContexts.length === 0) {
@@ -1432,7 +1438,7 @@ export async function disposeDefaultLlamaCpp(): Promise<void> {
 let defaultLLM: LLM | null = null;
 
 /**
- * Get the default LLM instance based on QMD_PROVIDER env var.
+ * Get the default LLM instance based on provider env var.
  * - "voyage" or "openai" → RemoteLLM (API-based)
  * - unset or "local" → LlamaCpp (local models)
  */
@@ -1461,14 +1467,14 @@ export function getProviderInfo(): { provider: string; embedModel: string; reran
   if (provider === "voyage") {
     return {
       provider: "voyage",
-      embedModel: process.env.VOYAGE_EMBED_MODEL || "voyage-4-lite",
-      rerankModel: process.env.VOYAGE_RERANK_MODEL || "rerank-2",
+      embedModel: process.env.QMD_VOYAGE_EMBED_MODEL || process.env.VOYAGE_EMBED_MODEL || "voyage-4-lite",
+      rerankModel: process.env.QMD_VOYAGE_RERANK_MODEL || process.env.VOYAGE_RERANK_MODEL || "rerank-2",
     };
   } else if (provider === "openai") {
     return {
       provider: "openai",
-      embedModel: process.env.OPENAI_EMBED_MODEL || "text-embedding-3-small",
-      rerankModel: "(none)",
+      embedModel: process.env.QMD_OPENAI_EMBED_MODEL || process.env.OPENAI_EMBED_MODEL || "text-embedding-3-small",
+      rerankModel: process.env.QMD_OPENAI_RERANK_MODEL || process.env.OPENAI_RERANK_MODEL || "(none)",
     };
   }
 

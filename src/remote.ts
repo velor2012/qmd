@@ -112,24 +112,24 @@ export class RemoteLLM implements LLM {
 
     // Get API key based on provider
     if (this.provider === "voyage") {
-      this.apiKey = config.apiKey || process.env.VOYAGE_API_KEY || "";
-      this.baseUrl = config.baseUrl || process.env.VOYAGE_API_BASE || VOYAGE_API_BASE;
-      this.embedModel = config.embedModel || process.env.VOYAGE_EMBED_MODEL || VOYAGE_EMBED_MODEL;
-      this.rerankModel = config.rerankModel || process.env.VOYAGE_RERANK_MODEL || VOYAGE_RERANK_MODEL;
+      this.apiKey = config.apiKey || process.env.QMD_VOYAGE_API_KEY || process.env.VOYAGE_API_KEY || "";
+      this.baseUrl = config.baseUrl || process.env.QMD_VOYAGE_API_BASE || process.env.VOYAGE_API_BASE || VOYAGE_API_BASE;
+      this.embedModel = config.embedModel || process.env.QMD_VOYAGE_EMBED_MODEL || process.env.VOYAGE_EMBED_MODEL || VOYAGE_EMBED_MODEL;
+      this.rerankModel = config.rerankModel || process.env.QMD_VOYAGE_RERANK_MODEL || process.env.VOYAGE_RERANK_MODEL || VOYAGE_RERANK_MODEL;
       
       if (!this.apiKey) {
-        throw new Error("Voyage API key required. Set VOYAGE_API_KEY environment variable.");
+        throw new Error("Voyage API key required. Set QMD_VOYAGE_API_KEY environment variable.");
       }
     } else {
       // OpenAI or OpenAI-compatible
-      this.apiKey = config.apiKey || process.env.OPENAI_API_KEY || "";
-      this.baseUrl = config.baseUrl || process.env.OPENAI_API_BASE || OPENAI_API_BASE;
-      this.embedModel = config.embedModel || process.env.OPENAI_EMBED_MODEL || OPENAI_EMBED_MODEL;
-      this.rerankModel = ""; // OpenAI doesn't have native reranking
+      this.apiKey = config.apiKey || process.env.QMD_OPENAI_API_KEY || process.env.OPENAI_API_KEY || "";
+      this.baseUrl = config.baseUrl || process.env.QMD_OPENAI_API_BASE || process.env.OPENAI_API_BASE || OPENAI_API_BASE;
+      this.embedModel = config.embedModel || process.env.QMD_OPENAI_EMBED_MODEL || process.env.OPENAI_EMBED_MODEL || OPENAI_EMBED_MODEL;
+      this.rerankModel = config.rerankModel || process.env.QMD_OPENAI_RERANK_MODEL || process.env.OPENAI_RERANK_MODEL || "";
       
       // Only require API key if using default OpenAI endpoint
       if (!this.apiKey && this.baseUrl === OPENAI_API_BASE) {
-        throw new Error("OpenAI API key required. Set OPENAI_API_KEY environment variable.");
+        throw new Error("OpenAI API key required. Set QMD_OPENAI_API_KEY environment variable.");
       }
     }
   }
@@ -300,16 +300,16 @@ export class RemoteLLM implements LLM {
     options: RerankOptions = {}
   ): Promise<RerankResult> {
     if (documents.length === 0) {
-      return { results: [], model: this.rerankModel };
+      return { results: [], model: this.rerankModel || "none" };
     }
+    const rerankModel = options.model || this.rerankModel || "";
 
-    // Only Voyage has native reranking
-    if (this.provider !== "voyage") {
+    if (!rerankModel || rerankModel === "(none)") {
       console.warn("Reranking not supported by OpenAI provider, returning original order.");
       return {
         results: documents.map((d, i) => ({
           file: d.file,
-          score: 1 - (i * 0.01), // Fake descending scores
+          score: 1 - (i * 0.01),
           index: i,
         })),
         model: "none",
@@ -322,7 +322,7 @@ export class RemoteLLM implements LLM {
       const body: RerankRequest = {
         query,
         documents: docTexts,
-        model: options.model || this.rerankModel,
+        model: rerankModel,
       };
       if (options.topK) {
         body.top_k = options.topK;
@@ -343,14 +343,14 @@ export class RemoteLLM implements LLM {
         model: response.model,
       };
     } catch (error) {
-      console.error("Voyage rerank error:", error);
+      console.error(`${this.provider} rerank error:`, error);
       return {
         results: documents.map((d, i) => ({
           file: d.file,
-          score: 0,
+          score: 1 - (i * 0.01),
           index: i,
         })),
-        model: this.rerankModel,
+        model: rerankModel || "none",
       };
     }
   }

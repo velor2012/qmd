@@ -491,12 +491,14 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 |----------|---------|-------------|
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
 | `QMD_PROVIDER` | `local` | Embedding provider: `local`, `voyage`, or `openai` |
-| `VOYAGE_API_KEY` | - | API key for Voyage AI (required when `QMD_PROVIDER=voyage`) |
-| `VOYAGE_EMBED_MODEL` | `voyage-4-lite` | Voyage embedding model |
-| `VOYAGE_RERANK_MODEL` | `rerank-2` | Voyage reranking model |
-| `OPENAI_API_KEY` | - | API key for OpenAI (required when `QMD_PROVIDER=openai`) |
-| `OPENAI_EMBED_MODEL` | `text-embedding-3-small` | OpenAI embedding model |
-| `OPENAI_API_BASE` | `https://api.openai.com/v1` | Base URL (for OpenAI-compatible APIs) |
+| `QMD_VOYAGE_API_KEY` | - | API key for Voyage AI (required when `QMD_PROVIDER=voyage`) |
+| `QMD_VOYAGE_API_BASE` | `https://api.voyageai.com/v1` | Base URL for Voyage API |
+| `QMD_VOYAGE_EMBED_MODEL` | `voyage-4-lite` | Voyage embedding model |
+| `QMD_VOYAGE_RERANK_MODEL` | `rerank-2` | Voyage reranking model |
+| `QMD_OPENAI_API_KEY` | - | API key for OpenAI (required when `QMD_PROVIDER=openai`) |
+| `QMD_OPENAI_EMBED_MODEL` | `text-embedding-3-small` | OpenAI embedding model |
+| `QMD_OPENAI_API_BASE` | `https://api.openai.com/v1` | Base URL (for OpenAI-compatible APIs) |
+| `QMD_RERANK_CONTEXT_SIZE` | `2048` | Local rerank context size |
 
 ### Remote Embedding Providers
 
@@ -508,7 +510,7 @@ QMD supports remote embedding APIs as an alternative to local models. This is us
 **Voyage AI** (recommended for quality):
 ```bash
 export QMD_PROVIDER=voyage
-export VOYAGE_API_KEY=your-api-key
+export QMD_VOYAGE_API_KEY=your-api-key
 
 qmd embed     # Uses Voyage for embeddings
 qmd vsearch "query"  # Uses Voyage for query embedding
@@ -518,10 +520,10 @@ qmd query "query"    # Uses Voyage for embeddings + reranking
 **OpenAI-compatible APIs**:
 ```bash
 export QMD_PROVIDER=openai
-export OPENAI_API_KEY=your-api-key
+export QMD_OPENAI_API_KEY=your-api-key
 
 # Or use a local OpenAI-compatible server (Ollama, vLLM, etc.)
-export OPENAI_API_BASE=http://localhost:11434/v1
+export QMD_OPENAI_API_BASE=http://localhost:11434/v1
 ```
 
 **Note:** Query expansion always uses local models (LlamaCpp) regardless of the provider setting.
